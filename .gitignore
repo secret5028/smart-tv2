@@ -1,0 +1,7 @@
+.platformio-local/
+__pycache__/
+*.pyc
+*.log
+*.zip
+
+tv_player/.pio/
