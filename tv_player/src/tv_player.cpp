@@ -78,6 +78,7 @@ static size_t gChannelIndex = 0;
 static uint32_t gChannelOverlayUntil = 0;
 static uint32_t gLastButtonAt = 0;
 static bool gLastButtonPressed = false;
+static bool gLastButtonLevel = true;
 
 static uint32_t readLe32(const uint8_t *buf) {
     return (uint32_t)buf[0] |
@@ -208,6 +209,7 @@ void playPcm(const uint8_t *samples, size_t count) {
 
 bool postChannel(const char *key) {
     WiFiClient api;
+    Serial.printf("channel api -> %s:%d / %s\n", SERVER_HOST, API_PORT, key);
     if (!api.connect(SERVER_HOST, API_PORT)) {
         Serial.println("channel api connect failed");
         return false;
@@ -232,10 +234,14 @@ bool postChannel(const char *key) {
     bool ok = false;
     while (api.connected() || api.available()) {
         String line = api.readStringUntil('\n');
+        line.trim();
+        if (line.length() > 0) {
+            Serial.printf("channel api resp: %s\n", line.c_str());
+        }
         if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200")) {
             ok = true;
         }
-        if (line == "\r" || line.length() == 0) {
+        if (line.length() == 0) {
             break;
         }
     }
@@ -249,12 +255,19 @@ bool postChannel(const char *key) {
 }
 
 bool handleChannelButton(WiFiClient *streamClient) {
-    bool pressed = digitalRead(PIN_SYS_OUT) == LOW;
+    int rawLevel = digitalRead(PIN_SYS_OUT);
+    bool pressed = rawLevel == LOW;
     uint32_t now = millis();
+
+    if ((rawLevel == LOW) != gLastButtonLevel) {
+        Serial.printf("button raw=%d pressed=%d\n", rawLevel, pressed ? 1 : 0);
+        gLastButtonLevel = (rawLevel == LOW);
+    }
 
     if (pressed && !gLastButtonPressed && (uint32_t)(now - gLastButtonAt) >= BUTTON_DEBOUNCE_MS) {
         gLastButtonAt = now;
         gChannelIndex = (gChannelIndex + 1) % (sizeof(CHANNELS) / sizeof(CHANNELS[0]));
+        Serial.printf("button accepted -> next channel %s\n", CHANNELS[gChannelIndex].key);
         if (postChannel(CHANNELS[gChannelIndex].key)) {
             showStatus("CHANNEL", CHANNELS[gChannelIndex].label, TFT_GREEN);
             delay(250);
@@ -425,6 +438,7 @@ void setup() {
 
     Serial.begin(115200);
     delay(200);
+    Serial.printf("button boot raw=%d\n", digitalRead(PIN_SYS_OUT));
 
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, HIGH);
