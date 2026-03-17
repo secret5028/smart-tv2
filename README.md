@@ -2,59 +2,54 @@
 
 Oracle Cloud VM에서 라이브 스트림을 FFmpeg로 MJPEG/PCM으로 변환해 ESP32-S3 LCD 보드로 TCP 송출하는 프로젝트다.
 
-## Current Stable Streaming Baseline
+## 구성
 
-- Video: `280x240`
-- Frame rate: `15fps`
-- JPEG quality: `q=12`
-- Audio: `16kHz`, mono, `pcm_u8`
-- Server buffer: `10s`
-- Max buffer: `14s`
-- Active source: KBS signed `m3u8`
+- `tv_server.py`
+  - VM에서 실행
+  - 입력 스트림을 MJPEG 비디오 + PCM u8 오디오로 변환
+  - ESP32 클라이언트에 TCP 브로드캐스트
+- `tv_player/`
+  - Waveshare ESP32-S3-Touch-LCD-1.69 (V2)용 PlatformIO 펌웨어
+  - TCP 패킷을 받아 JPEG 디코드 후 LCD 출력
+  - PCM u8 오디오를 I2S 스피커로 재생
 
-Rollback baseline before touch UI work:
+## 현재 안정 설정
 
-- Tag: `rollback-pre-swipe-ui`
-- Commit: `232497b`
-- Notes: [docs/ROLLBACK_BASELINES.md](/c:/Users/AAA/Desktop/esptv2/docs/ROLLBACK_BASELINES.md)
+현재 확인된 실사용 설정은 아래와 같다.
 
-## Server
+- 비디오 출력: `280x240`
+- 프레임레이트: `15fps`
+- JPEG 품질: `q=12`
+- 오디오: `16kHz`, mono, `pcm_u8`
+- 서버 버퍼: `10초`
+- 최대 버퍼: `14초`
+- 실사용 소스: KBS signed `m3u8`
 
-`tv_server.py` runs on Linux and pushes packets in this format:
+## 서버 실행
 
-```text
-[0xAA][0xBB][video size LE][JPEG][audio size LE][PCM u8]
-```
-
-Run:
+리눅스 VM에서 실행한다.
 
 ```bash
 python3 tv_server.py --url "SIGNED_M3U8_URL" --port 9000 --verbose
 ```
 
-## Firmware
+KBS 같은 signed `m3u8`는 만료되므로, 만료 시 새 URL로 다시 실행해야 한다.
 
-`tv_player/` contains the PlatformIO firmware for Waveshare ESP32-S3-Touch-LCD-1.69 V2.
-
-Current firmware behavior:
-
-- Connects to Wi-Fi and TCP stream server
-- Renders JPEG frames and plays PCM audio
-- Calls channel API on `SERVER_HOST:9001`
-- Uses touch swipe for channel switching
-- Shows channel name in green at top-left for 3 seconds
-- Shows monochrome analog-style noise while connecting or buffering
-
-## Build
+## 펌웨어 빌드
 
 ```bash
 cd tv_player
 pio run
+```
+
+업로드:
+
+```bash
 pio run -t upload
 ```
 
-## Notes
+## 참고
 
-- `tv_server.py` uses `pass_fds`, so it must run on Linux, not Windows.
-- Signed `m3u8` URLs expire and must be refreshed.
-- Touch controller auto-detection in the firmware currently probes common I2C pin pairs at runtime.
+- 현재 서버 구현은 `pass_fds`를 사용하므로 Windows가 아니라 Linux VM에서 실행해야 한다.
+- ESP32는 Wi-Fi 연결 후 `SERVER_HOST:SERVER_PORT`로 plain TCP 접속한다.
+- 빌드 산출물과 로그는 Git에 포함하지 않는다.

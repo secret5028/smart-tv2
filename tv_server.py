@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """TCP MJPEG/PCM stream server for ESP32 TV player."""
 
+from __future__ import annotations
+
 import argparse
+import json
 import logging
 import os
 import select
@@ -11,13 +14,31 @@ import subprocess
 import threading
 import time
 from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 
-CHANNELS = {
-    "ytn": "https://www.youtube.com/channel/UCk0QSdHCADlHAm5SHSZ_4eA/live",
-    "mbc": "https://www.youtube.com/channel/UCF2GJqHCMuFmHsBgGDVbOEQ/live",
-    "kbs": "https://www.youtube.com/channel/UCcQTRi69dsVYHN3exePtZ1A/live",
+CHANNELS: dict[str, dict[str, str]] = {
+    "kbs": {"name": "KBS News24", "type": "direct", "url": "https://news24.gscdn.kbs.co.kr/news24-02/news24-02_hd.m3u8?Policy=eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly9uZXdzMjQuZ3NjZG4ua2JzLmNvLmtyL25ld3MyNC0wMi8qIiwiQ29uZGl0aW9uIjp7IkRhdGVMZXNzVGhhbiI6eyJBV1M6RXBvY2hUaW1lIjoxNzczOTI3NjgwfX19XX0_&Key-Pair-Id=APKAICDSGT3Y7IXGJ3TA&Signature=b3Ei6FLyKdLtLy3oM6J8y2vCbaa9zqARqFN5NVY3utG9QqwAXNqXXWwKTLSVdmG0UF7Dx-h0jpHhpuJmlvzJ81vfuPZX4Di1DnVH4u0E1ANFPs~~tHc958m8CE8-1hhw60sNV-nRL4jH9lGvT4st-2Q8~QKyqE20qGY~zrQwsmntIrPFhhQgP3gIxetmjDPlzGelMfSa9vuW~4MqtgHpGI~M-O6dz3L7bamklctKltSyaO8z~A-rZQoW5Ae9Y0GFsg01wCD5MAaABYbyvSjeo7JMh~ObQUu4gURyUT7e21SfXh5FxAJsq0wq-fX2KBA3nBqeM5NSmRDblIZOyX5a-A__"},
+    "ytn": {"name": "YTN", "type": "youtube", "url": "https://www.youtube.com/@ytnnews24/live"},
+    "sbsnews": {"name": "SBS News", "type": "youtube", "url": "https://www.youtube.com/@SBSnews8/live"},
+    "kbsworld": {"name": "KBS World", "type": "youtube", "url": "https://www.youtube.com/@KBSWorldTV/live"},
+    "jtbc": {"name": "JTBC News", "type": "youtube", "url": "https://www.youtube.com/@jtbc_news/live"},
+    "mbn": {"name": "MBN", "type": "youtube", "url": "https://www.youtube.com/@MBN/live"},
+    "goodtv": {"name": "GoodTV", "type": "direct", "url": "http://mobliestream.c3tv.com:1935/live/goodtv.sdp/playlist.m3u8"},
+    "ebs1": {"name": "EBS1", "type": "direct", "url": "https://ebsonair.ebs.co.kr/ebs1familypc/familypc1m/playlist.m3u8"},
+    "ebs2": {"name": "EBS2", "type": "direct", "url": "https://ebsonair.ebs.co.kr/ebs2familypc/familypc1m/playlist.m3u8"},
+    "ebskids": {"name": "EBS Kids", "type": "direct", "url": "https://ebsonair.ebs.co.kr/ebsufamilypc/familypc1m/playlist.m3u8"},
+    "fgtv": {"name": "FGTV", "type": "direct", "url": "https://fgtvlive.fgtv.com/smil:fgtv.smil/playlist.m3u8"},
+    "lotte": {"name": "Lotte iMall", "type": "direct", "url": "https://pchlslivesw.lotteimall.com/live/livestream/lotteimalllive_mp4.m3u8"},
+    "mbc_chuncheon": {"name": "MBC Chuncheon", "type": "direct", "url": "https://stream.chmbc.co.kr/TV/myStream/playlist.m3u8"},
+    "mbc_yeosu": {"name": "MBC Yeosu", "type": "direct", "url": "https://5c3639aa99149.streamlock.net/live_TV/tv/playlist.m3u8"},
+    "jibs": {"name": "JIBS", "type": "direct", "url": "http://123.140.197.22/stream/1/play.m3u8"},
+    "jtv": {"name": "JTV", "type": "direct", "url": "http://61.85.197.53:1935/jtv_live/myStream/playlist.m3u8"},
+    "oun": {"name": "OUN", "type": "direct", "url": "https://live.knou.ac.kr/knou1/live1/playlist.m3u8"},
+    "wshopping": {"name": "W Shopping", "type": "direct", "url": "https://liveout.catenoid.net/live-05-wshopping/wshopping_1500k/playlist.m3u8"},
+    "shinsegae": {"name": "Shinsegae TV", "type": "direct", "url": "https://liveout.catenoid.net/live-02-shinsegaetvshopping/shinsegaetvshopping_720p/playlist.m3u8"},
+    "nhtv": {"name": "NH TV", "type": "direct", "url": "http://nonghyup.flive.skcdn.com/nonghyup/_definst_/nhlive/playlist.m3u8"},
 }
 
 HOST = "0.0.0.0"
@@ -36,18 +57,38 @@ MAX_BUFFER_SECONDS = 14.0
 LOG = logging.getLogger("tv_server")
 
 
-def resolve_stream_url(source: str) -> str:
-    if "youtube.com" not in source and "youtu.be" not in source:
-        return source
+class ServerState:
+    def __init__(self, initial_channel: str) -> None:
+        self._lock = threading.Lock()
+        self._current_channel = initial_channel
+        self._change_serial = 0
+
+    def get(self) -> tuple[str, int]:
+        with self._lock:
+            return self._current_channel, self._change_serial
+
+    def set_channel(self, channel_key: str) -> None:
+        with self._lock:
+            if self._current_channel == channel_key:
+                return
+            self._current_channel = channel_key
+            self._change_serial += 1
+        LOG.info("channel changed to %s (%s)", channel_key, CHANNELS[channel_key]["name"])
+
+
+def resolve_stream_url(channel_key: str) -> str:
+    channel = CHANNELS[channel_key]
+    if channel["type"] == "direct":
+        return channel["url"]
 
     cmd = [
         "yt-dlp",
         "--no-warnings",
         "--no-playlist",
         "-g",
-        source,
+        channel["url"],
     ]
-    LOG.info("resolving stream URL with yt-dlp: %s", source)
+    LOG.info("resolving stream URL with yt-dlp: %s", channel["url"])
     result = subprocess.run(
         cmd,
         check=True,
@@ -57,7 +98,7 @@ def resolve_stream_url(source: str) -> str:
     for line in result.stdout.splitlines():
         line = line.strip()
         if line:
-            LOG.info("resolved direct stream URL")
+            LOG.info("resolved direct stream URL for %s", channel_key)
             return line
     raise RuntimeError("yt-dlp did not return a stream URL")
 
@@ -65,9 +106,11 @@ def resolve_stream_url(source: str) -> str:
 class ClientManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._clients = []
+        self._clients: list[socket.socket] = []
 
     def add(self, conn: socket.socket) -> None:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.settimeout(0.5)
         with self._lock:
             self._clients.append(conn)
             total = len(self._clients)
@@ -78,7 +121,7 @@ class ClientManager:
         LOG.info("client connected: %s (total=%d)", peer, total)
 
     def broadcast(self, data: bytes) -> None:
-        dead = []
+        dead: list[socket.socket] = []
         with self._lock:
             clients = list(self._clients)
 
@@ -105,6 +148,79 @@ class ClientManager:
     def count(self) -> int:
         with self._lock:
             return len(self._clients)
+
+
+class ControlHandler(BaseHTTPRequestHandler):
+    state: ServerState
+
+    def do_GET(self) -> None:
+        if self.path == "/channels":
+            body = json.dumps(
+                {
+                    key: {"name": value["name"], "type": value["type"]}
+                    for key, value in CHANNELS.items()
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+            return
+
+        if self.path == "/status":
+            channel_key, serial = self.state.get()
+            channel = CHANNELS[channel_key]
+            body = json.dumps(
+                {
+                    "channel": channel_key,
+                    "name": channel["name"],
+                    "type": channel["type"],
+                    "change_serial": serial,
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+            return
+
+        self._send(404, "text/plain", b"not found")
+
+    def do_POST(self) -> None:
+        if not self.path.startswith("/channel/"):
+            self._send(404, "text/plain", b"not found")
+            return
+
+        channel_key = self.path[len("/channel/") :]
+        if channel_key not in CHANNELS:
+            self._send(404, "text/plain", f"unknown channel: {channel_key}".encode("utf-8"))
+            return
+
+        self.state.set_channel(channel_key)
+        body = json.dumps(
+            {"ok": True, "channel": channel_key, "name": CHANNELS[channel_key]["name"]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self._send(200, "application/json; charset=utf-8", body)
+
+    def _send(self, code: int, ctype: str, body: bytes) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt: str, *args) -> None:
+        LOG.debug("api %s - " + fmt, self.address_string(), *args)
+
+
+def start_control_server(state: ServerState, host: str, port: int) -> ThreadingHTTPServer:
+    class Handler(ControlHandler):
+        pass
+
+    Handler.state = state
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    LOG.info("control api listening on %s:%d", host, port)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd
 
 
 class MjpegReader:
@@ -140,15 +256,15 @@ class MjpegReader:
 
 
 class FFmpegPipeline:
-    def __init__(self, source: str, verbose: bool = False) -> None:
-        self._source = source
+    def __init__(self, channel_key: str, verbose: bool = False) -> None:
+        self._channel_key = channel_key
         self._verbose = verbose
-        self._proc = None
-        self.video_fd = None
-        self.audio_fd = None
+        self._proc: Optional[subprocess.Popen] = None
+        self.video_fd: Optional[int] = None
+        self.audio_fd: Optional[int] = None
 
     def start(self) -> None:
-        stream_url = resolve_stream_url(self._source)
+        stream_url = resolve_stream_url(self._channel_key)
         video_r, video_w = os.pipe()
         audio_r, audio_w = os.pipe()
 
@@ -183,7 +299,7 @@ class FFmpegPipeline:
             str(JPEG_QUALITY),
             "-pix_fmt",
             "yuvj420p",
-            "pipe:%d" % video_w,
+            f"pipe:{video_w}",
             "-map",
             "0:a:0?",
             "-vn",
@@ -195,7 +311,7 @@ class FFmpegPipeline:
             "u8",
             "-acodec",
             "pcm_u8",
-            "pipe:%d" % audio_w,
+            f"pipe:{audio_w}",
         ]
 
         try:
@@ -218,7 +334,7 @@ class FFmpegPipeline:
         os.close(audio_w)
         self.video_fd = video_r
         self.audio_fd = audio_r
-        LOG.info("ffmpeg started (pid=%d)", self._proc.pid)
+        LOG.info("ffmpeg started for %s (pid=%d)", self._channel_key, self._proc.pid)
 
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -286,13 +402,15 @@ def accept_loop(server: socket.socket, clients: ClientManager) -> None:
             conn, _ = server.accept()
         except OSError:
             return
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         clients.add(conn)
 
 
-def stream_loop(stream_url: str, clients: ClientManager, verbose: bool) -> None:
+def stream_loop(state: ServerState, clients: ClientManager, verbose: bool) -> None:
     while True:
-        pipeline = FFmpegPipeline(stream_url, verbose=verbose)
+        channel_key, change_serial = state.get()
+        packet_buffer: deque[tuple[float, bytes]] = deque()
+        pipeline = FFmpegPipeline(channel_key, verbose=verbose)
+
         try:
             pipeline.start()
             assert pipeline.video_fd is not None
@@ -300,12 +418,16 @@ def stream_loop(stream_url: str, clients: ClientManager, verbose: bool) -> None:
 
             video_reader = MjpegReader(pipeline.video_fd)
             audio_buffer = bytearray()
-            packet_buffer = deque()
             source_time = 0.0
             next_frame_at = time.monotonic()
             buffering = True
 
             while pipeline.is_alive():
+                current_channel, current_serial = state.get()
+                if current_serial != change_serial or current_channel != channel_key:
+                    LOG.info("channel switch requested, restarting ffmpeg")
+                    break
+
                 fill_audio_buffer(pipeline.audio_fd, audio_buffer)
                 jpeg_bytes = video_reader.read_frame()
                 if jpeg_bytes is None:
@@ -339,8 +461,7 @@ def stream_loop(stream_url: str, clients: ClientManager, verbose: bool) -> None:
                 if buffering:
                     continue
 
-                now = time.monotonic()
-                delay = next_frame_at - now
+                delay = next_frame_at - time.monotonic()
                 if delay > 0:
                     time.sleep(delay)
 
@@ -348,7 +469,8 @@ def stream_loop(stream_url: str, clients: ClientManager, verbose: bool) -> None:
                     _, packet = packet_buffer.popleft()
                     clients.broadcast(packet)
                     LOG.debug(
-                        "broadcast buffered frame clients=%d queued=%d",
+                        "broadcast buffered frame channel=%s clients=%d queued=%d",
+                        channel_key,
                         clients.count(),
                         len(packet_buffer),
                     )
@@ -367,19 +489,20 @@ def stream_loop(stream_url: str, clients: ClientManager, verbose: bool) -> None:
         finally:
             pipeline.stop()
 
-        LOG.warning("restarting ffmpeg in 3 seconds")
-        time.sleep(3)
+        current_channel, current_serial = state.get()
+        if current_serial == change_serial and current_channel == channel_key:
+            LOG.warning("restarting ffmpeg in 3 seconds")
+            time.sleep(3)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Pull a live stream with FFmpeg and push MJPEG+PCM packets to ESP32 clients."
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--url", help="direct stream URL")
-    group.add_argument("--channel", choices=sorted(CHANNELS), help="built-in channel name")
+    parser.add_argument("--channel", choices=sorted(CHANNELS), default="ytn", help="built-in channel name")
     parser.add_argument("--host", default=HOST, help="listen host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=9000, help="listen port (default: 9000)")
+    parser.add_argument("--port", type=int, default=9000, help="stream port (default: 9000)")
+    parser.add_argument("--control-port", type=int, default=9001, help="control API port (default: 9001)")
     parser.add_argument("--verbose", action="store_true", help="enable verbose logging")
     return parser.parse_args()
 
@@ -392,36 +515,37 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    stream_url = args.url or CHANNELS[args.channel]
-    LOG.info("stream source: %s", stream_url)
     LOG.info(
-        "video=%dx%d@%dfps audio=%dHz pcm_u8 chunk=%d",
+        "video=%dx%d@%dfps audio=%dHz pcm_u8 chunk=%d q=%d",
         WIDTH,
         HEIGHT,
         FPS,
         AUDIO_RATE,
         AUDIO_CHUNK,
+        JPEG_QUALITY,
     )
 
+    state = ServerState(args.channel)
     clients = ClientManager()
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((args.host, args.port))
     server.listen()
-    LOG.info("listening on %s:%d", args.host, args.port)
+    LOG.info("stream server listening on %s:%d", args.host, args.port)
 
-    thread = threading.Thread(target=accept_loop, args=(server, clients), daemon=True)
-    thread.start()
+    accept_thread = threading.Thread(target=accept_loop, args=(server, clients), daemon=True)
+    accept_thread.start()
+
+    control_server = start_control_server(state, args.host, args.control_port)
 
     try:
-        stream_loop(stream_url, clients, args.verbose)
+        stream_loop(state, clients, args.verbose)
     except KeyboardInterrupt:
         LOG.info("shutting down")
     finally:
-        try:
-            server.close()
-        except OSError:
-            pass
+        control_server.shutdown()
+        server.close()
 
 
 if __name__ == "__main__":
