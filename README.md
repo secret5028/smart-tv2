@@ -19,7 +19,7 @@ Oracle Cloud VM에서 라이브 스트림을 FFmpeg로 MJPEG/PCM으로 변환해
 
 - 비디오 출력: `280x240`
 - 프레임레이트: `15fps`
-- JPEG 품질: `q=10`
+- JPEG 품질: `q=12`
 - 오디오: `16kHz`, mono, `pcm_u8`
 - 서버 버퍼: `10초`
 - 최대 버퍼: `14초`
