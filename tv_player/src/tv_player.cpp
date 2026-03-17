@@ -1,8 +1,9 @@
 #include <Arduino.h>
-#include <WiFi.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <JPEGDEC.h>
+#include <WiFi.h>
+#include <Wire.h>
 #include <driver/i2s.h>
 #include <esp32-hal-psram.h>
 
@@ -22,6 +23,10 @@
 #define SERVER_PORT 9000
 #endif
 
+#ifndef API_PORT
+#define API_PORT 9001
+#endif
+
 static constexpr gpio_num_t PIN_SYS_EN = GPIO_NUM_41;
 static constexpr gpio_num_t PIN_SYS_OUT = GPIO_NUM_40;
 static constexpr gpio_num_t PIN_I2S_BCLK = GPIO_NUM_14;
@@ -35,25 +40,135 @@ static constexpr uint32_t TCP_TIMEOUT_MS = 8000;
 static constexpr uint32_t RECONNECT_DELAY_MS = 3000;
 static constexpr uint8_t MAGIC0 = 0xAA;
 static constexpr uint8_t MAGIC1 = 0xBB;
+static constexpr uint8_t TOUCH_ADDR = 0x15;
+static constexpr uint16_t SWIPE_MIN_DELTA = 60;
+static constexpr uint16_t SWIPE_MAX_OFF_AXIS = 50;
+static constexpr uint32_t CHANNEL_LABEL_MS = 3000;
+static constexpr uint32_t BUFFER_SCREEN_INTERVAL_MS = 120;
+static constexpr size_t MAX_CHANNELS = 24;
+
+struct TouchPins {
+    int sda;
+    int scl;
+};
+
+static constexpr TouchPins TOUCH_CANDIDATES[] = {
+    {11, 10},
+    {18, 17},
+    {47, 48},
+    {2, 1},
+    {39, 38},
+};
+
+enum class UiMode {
+    Connecting,
+    Buffering,
+    Streaming,
+    Error,
+};
+
+struct TouchState {
+    bool active = false;
+    bool wasDown = false;
+    uint16_t startX = 0;
+    uint16_t startY = 0;
+    uint32_t startAt = 0;
+};
 
 static TFT_eSPI tft;
 static JPEGDEC jpeg;
 static uint8_t *gRxBuf = nullptr;
 static bool gI2sReady = false;
+static bool gTouchReady = false;
+static TouchPins gTouchPins = {-1, -1};
+static TouchState gTouchState;
+static UiMode gUiMode = UiMode::Connecting;
+static String gUiMessage = "connecting...";
+static uint32_t gLastBufferDrawAt = 0;
+static uint32_t gChannelOverlayUntil = 0;
+static uint32_t gLastFrameAt = 0;
+static bool gReconnectRequested = false;
+static String gPendingChannelName;
+static String gChannelKeys[MAX_CHANNELS];
+static String gChannelNames[MAX_CHANNELS];
+static size_t gChannelCount = 0;
+static int gCurrentChannelIndex = 0;
 
 static uint32_t readLe32(const uint8_t *buf) {
-    return (uint32_t)buf[0] |
-           ((uint32_t)buf[1] << 8) |
-           ((uint32_t)buf[2] << 16) |
-           ((uint32_t)buf[3] << 24);
+    return (uint32_t)buf[0]
+         | ((uint32_t)buf[1] << 8)
+         | ((uint32_t)buf[2] << 16)
+         | ((uint32_t)buf[3] << 24);
 }
 
-int jpegDraw(JPEGDRAW *pDraw) {
+static uint16_t gray565(uint8_t gray) {
+    return (uint16_t)(((gray >> 3) << 11) | ((gray >> 2) << 5) | (gray >> 3));
+}
+
+static void setUiMode(UiMode mode, const String &message) {
+    gUiMode = mode;
+    gUiMessage = message;
+    if (mode != UiMode::Streaming) {
+        gLastBufferDrawAt = 0;
+    }
+}
+
+static void showChannelOverlay() {
+    if (millis() > gChannelOverlayUntil || gPendingChannelName.isEmpty()) {
+        return;
+    }
+
+    const int pad = 4;
+    const int x = 6;
+    const int y = 6;
+    tft.setTextFont(1);
+    tft.setTextSize(1);
+    int w = (int)gPendingChannelName.length() * 6 + pad * 2;
+    if (w > tft.width() - 12) {
+        w = tft.width() - 12;
+    }
+    tft.fillRect(x - 2, y - 2, w + 4, 14, TFT_BLACK);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString(gPendingChannelName, x + pad, y + 1);
+}
+
+static void drawBufferingNoise() {
+    uint32_t now = millis();
+    if (now - gLastBufferDrawAt < BUFFER_SCREEN_INTERVAL_MS) {
+        return;
+    }
+    gLastBufferDrawAt = now;
+
+    for (int y = 0; y < tft.height(); ++y) {
+        uint8_t gray = 70 + (esp_random() % 120);
+        tft.drawFastHLine(0, y, tft.width(), gray565(gray));
+    }
+
+    for (int i = 0; i < 180; ++i) {
+        int x = esp_random() % tft.width();
+        int y = esp_random() % tft.height();
+        uint16_t c = (esp_random() & 1U) ? TFT_WHITE : TFT_BLACK;
+        tft.drawPixel(x, y, c);
+    }
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(gUiMessage, tft.width() / 2, tft.height() / 2 - 8);
+    tft.setTextFont(1);
+    tft.setTextSize(1);
+    tft.drawString("analog buffer screen", tft.width() / 2, tft.height() / 2 + 18);
+    tft.setTextDatum(TL_DATUM);
+    showChannelOverlay();
+}
+
+static int jpegDraw(JPEGDRAW *pDraw) {
     tft.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
     return 1;
 }
 
-void showStatus(const char *title, const char *msg, uint16_t color) {
+static void showStatus(const char *title, const char *msg, uint16_t color) {
     tft.fillScreen(TFT_BLACK);
     tft.setTextDatum(TL_DATUM);
     tft.setTextFont(2);
@@ -65,30 +180,7 @@ void showStatus(const char *title, const char *msg, uint16_t color) {
     tft.drawString(msg, 12, 100);
 }
 
-void connectWifi() {
-    showStatus("WIFI", "connecting...", TFT_YELLOW);
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    uint32_t startAt = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-        if ((uint32_t)(millis() - startAt) >= 20000U) {
-            showStatus("WIFI", "timeout, reboot", TFT_RED);
-            delay(1000);
-            ESP.restart();
-        }
-        delay(250);
-    }
-
-    String ip = WiFi.localIP().toString();
-    Serial.printf("WiFi connected: %s\n", ip.c_str());
-    showStatus("WIFI", ip.c_str(), TFT_GREEN);
-    delay(500);
-}
-
-void initI2S() {
+static void initI2S() {
     if (gI2sReady) {
         return;
     }
@@ -112,15 +204,12 @@ void initI2S() {
     pins.data_out_num = PIN_I2S_DOUT;
     pins.data_in_num = I2S_PIN_NO_CHANGE;
 
-    esp_err_t err = i2s_driver_install(I2S_NUM_1, &config, 0, nullptr);
-    if (err != ESP_OK) {
-        Serial.printf("i2s_driver_install failed: %d\n", (int)err);
+    if (i2s_driver_install(I2S_NUM_1, &config, 0, nullptr) != ESP_OK) {
+        Serial.println("i2s_driver_install failed");
         return;
     }
-
-    err = i2s_set_pin(I2S_NUM_1, &pins);
-    if (err != ESP_OK) {
-        Serial.printf("i2s_set_pin failed: %d\n", (int)err);
+    if (i2s_set_pin(I2S_NUM_1, &pins) != ESP_OK) {
+        Serial.println("i2s_set_pin failed");
         return;
     }
 
@@ -128,7 +217,7 @@ void initI2S() {
     gI2sReady = true;
 }
 
-void playPcm(const uint8_t *samples, size_t count) {
+static void playPcm(const uint8_t *samples, size_t count) {
     if (!gI2sReady || count == 0) {
         return;
     }
@@ -149,20 +238,345 @@ void playPcm(const uint8_t *samples, size_t count) {
         }
 
         size_t written = 0;
-        i2s_write(I2S_NUM_1, stereo, chunkSamples * sizeof(int16_t) * 2, &written, portMAX_DELAY);
+        i2s_write(
+            I2S_NUM_1,
+            stereo,
+            chunkSamples * sizeof(int16_t) * 2,
+            &written,
+            portMAX_DELAY
+        );
         offset += chunkSamples;
     }
 }
 
-bool recvExact(WiFiClient &client, uint8_t *dst, size_t n) {
+static bool httpRequest(const char *method, const String &path, String &body) {
+    WiFiClient client;
+    if (!client.connect(SERVER_HOST, API_PORT)) {
+        return false;
+    }
+
+    client.printf(
+        "%s %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        method,
+        path.c_str(),
+        SERVER_HOST,
+        API_PORT
+    );
+
+    uint32_t deadline = millis() + 5000;
+    while (client.connected() && !client.available()) {
+        if ((int32_t)(millis() - deadline) > 0) {
+            client.stop();
+            return false;
+        }
+        delay(1);
+    }
+
+    String response;
+    while (client.connected() || client.available()) {
+        while (client.available()) {
+            response += (char)client.read();
+        }
+        delay(1);
+    }
+    client.stop();
+
+    int sep = response.indexOf("\r\n\r\n");
+    if (sep < 0) {
+        return false;
+    }
+    body = response.substring(sep + 4);
+    return true;
+}
+
+static int findMatchingBrace(const String &json, int openPos) {
+    int depth = 0;
+    for (int i = openPos; i < json.length(); ++i) {
+        char c = json[i];
+        if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+            if (depth == 0) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+static String extractJsonString(const String &json, const String &field, int start, int end) {
+    String needle = "\"" + field + "\"";
+    int keyPos = json.indexOf(needle, start);
+    if (keyPos < 0 || keyPos >= end) {
+        return String();
+    }
+    int colon = json.indexOf(':', keyPos + needle.length());
+    if (colon < 0 || colon >= end) {
+        return String();
+    }
+    int q1 = json.indexOf('"', colon + 1);
+    if (q1 < 0 || q1 >= end) {
+        return String();
+    }
+    int q2 = json.indexOf('"', q1 + 1);
+    if (q2 < 0 || q2 >= end) {
+        return String();
+    }
+    return json.substring(q1 + 1, q2);
+}
+
+static void setFallbackChannelList() {
+    gChannelCount = 1;
+    gChannelKeys[0] = "kbs";
+    gChannelNames[0] = "kbs";
+    gCurrentChannelIndex = 0;
+    gPendingChannelName = gChannelNames[0];
+}
+
+static bool loadChannelList() {
+    String body;
+    if (!httpRequest("GET", "/channels", body)) {
+        return false;
+    }
+
+    size_t count = 0;
+    int pos = 0;
+    while (count < MAX_CHANNELS) {
+        int keyOpen = body.indexOf('"', pos);
+        if (keyOpen < 0) {
+            break;
+        }
+        int keyClose = body.indexOf('"', keyOpen + 1);
+        if (keyClose < 0) {
+            break;
+        }
+        String key = body.substring(keyOpen + 1, keyClose);
+        int colon = body.indexOf(':', keyClose + 1);
+        int objOpen = body.indexOf('{', colon + 1);
+        if (colon < 0 || objOpen < 0) {
+            break;
+        }
+        int objClose = findMatchingBrace(body, objOpen);
+        if (objClose < 0) {
+            break;
+        }
+
+        String name = extractJsonString(body, "name", objOpen, objClose);
+        if (!key.isEmpty()) {
+            gChannelKeys[count] = key;
+            gChannelNames[count] = name.isEmpty() ? key : name;
+            ++count;
+        }
+        pos = objClose + 1;
+    }
+
+    if (count == 0) {
+        return false;
+    }
+
+    gChannelCount = count;
+    return true;
+}
+
+static bool syncCurrentChannel() {
+    String body;
+    if (!httpRequest("GET", "/status", body)) {
+        return false;
+    }
+
+    String channel = extractJsonString(body, "channel", 0, body.length());
+    String name = extractJsonString(body, "name", 0, body.length());
+    if (channel.isEmpty()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < gChannelCount; ++i) {
+        if (gChannelKeys[i] == channel) {
+            gCurrentChannelIndex = (int)i;
+            gPendingChannelName = name.isEmpty() ? gChannelNames[i] : name;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool postChannelChange(const String &key) {
+    String body;
+    return httpRequest("POST", "/channel/" + key, body);
+}
+
+static bool cstRead(uint8_t reg, uint8_t *dst, size_t len) {
+    Wire.beginTransmission(TOUCH_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) {
+        return false;
+    }
+    int got = Wire.requestFrom((int)TOUCH_ADDR, (int)len);
+    if (got != (int)len) {
+        while (Wire.available()) {
+            (void)Wire.read();
+        }
+        return false;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        dst[i] = (uint8_t)Wire.read();
+    }
+    return true;
+}
+
+static bool initTouch() {
+    for (const TouchPins &pins : TOUCH_CANDIDATES) {
+        Wire.end();
+        Wire.begin(pins.sda, pins.scl, 400000U);
+        Wire.beginTransmission(TOUCH_ADDR);
+        if (Wire.endTransmission() == 0) {
+            gTouchPins = pins;
+            gTouchReady = true;
+            Serial.printf("touch ready on SDA=%d SCL=%d\n", pins.sda, pins.scl);
+            uint8_t mode = 0x00;
+            (void)cstRead(0x00, &mode, 1);
+            return true;
+        }
+    }
+
+    Serial.println("touch controller not found");
+    return false;
+}
+
+static bool readTouchPoint(uint16_t &x, uint16_t &y) {
+    if (!gTouchReady) {
+        return false;
+    }
+
+    uint8_t buf[5];
+    if (!cstRead(0x02, buf, sizeof(buf))) {
+        return false;
+    }
+    if ((buf[0] & 0x0F) == 0) {
+        return false;
+    }
+
+    uint16_t rawX = (uint16_t)(((buf[1] & 0x0F) << 8) | buf[2]);
+    uint16_t rawY = (uint16_t)(((buf[3] & 0x0F) << 8) | buf[4]);
+
+    uint16_t mappedX = rawY;
+    uint16_t mappedY = rawX;
+
+    if (mappedX >= (uint16_t)tft.width()) {
+        mappedX = (uint16_t)(tft.width() - 1);
+    }
+    if (mappedY >= (uint16_t)tft.height()) {
+        mappedY = (uint16_t)(tft.height() - 1);
+    }
+
+    x = mappedX;
+    y = mappedY;
+    return true;
+}
+
+static void beginChannelOverlay(const String &name) {
+    gPendingChannelName = name;
+    gChannelOverlayUntil = millis() + CHANNEL_LABEL_MS;
+}
+
+static void requestChannelDelta(int delta) {
+    if (gChannelCount == 0 || delta == 0) {
+        return;
+    }
+
+    int next = gCurrentChannelIndex + delta;
+    if (next < 0) {
+        next = (int)gChannelCount - 1;
+    } else if (next >= (int)gChannelCount) {
+        next = 0;
+    }
+
+    if (!postChannelChange(gChannelKeys[next])) {
+        setUiMode(UiMode::Error, "channel change failed");
+        drawBufferingNoise();
+        delay(400);
+        return;
+    }
+
+    gCurrentChannelIndex = next;
+    beginChannelOverlay(gChannelNames[next]);
+    setUiMode(UiMode::Buffering, "buffering...");
+    gReconnectRequested = true;
+}
+
+static void pollTouch() {
+    uint16_t x = 0;
+    uint16_t y = 0;
+    bool down = readTouchPoint(x, y);
+    uint32_t now = millis();
+
+    if (down && !gTouchState.wasDown) {
+        gTouchState.active = true;
+        gTouchState.startX = x;
+        gTouchState.startY = y;
+        gTouchState.startAt = now;
+    } else if (!down && gTouchState.wasDown && gTouchState.active) {
+        int dx = (int)x - (int)gTouchState.startX;
+        int dy = (int)y - (int)gTouchState.startY;
+
+        if (abs(dx) >= SWIPE_MIN_DELTA && abs(dy) <= SWIPE_MAX_OFF_AXIS) {
+            if (dx < 0) {
+                requestChannelDelta(+1);
+            } else {
+                requestChannelDelta(-1);
+            }
+        }
+        gTouchState.active = false;
+    }
+
+    gTouchState.wasDown = down;
+}
+
+static void serviceUi() {
+    pollTouch();
+    if (gUiMode != UiMode::Streaming) {
+        drawBufferingNoise();
+    }
+}
+
+static void connectWifi() {
+    showStatus("WIFI", "connecting...", TFT_YELLOW);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    uint32_t startAt = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if ((uint32_t)(millis() - startAt) >= 20000U) {
+            showStatus("WIFI", "timeout, reboot", TFT_RED);
+            delay(1000);
+            ESP.restart();
+        }
+        delay(250);
+    }
+
+    String ip = WiFi.localIP().toString();
+    Serial.printf("WiFi connected: %s\n", ip.c_str());
+    showStatus("WIFI", ip.c_str(), TFT_GREEN);
+    delay(500);
+}
+
+static bool recvExact(WiFiClient &client, uint8_t *dst, size_t n) {
     size_t received = 0;
     uint32_t deadline = millis() + TCP_TIMEOUT_MS;
 
     while (received < n) {
+        serviceUi();
+
+        if (gReconnectRequested) {
+            client.stop();
+            return false;
+        }
         if (!client.connected()) {
             return false;
         }
-
         if ((int32_t)(millis() - deadline) > 0) {
             return false;
         }
@@ -191,32 +605,55 @@ bool recvExact(WiFiClient &client, uint8_t *dst, size_t n) {
     return true;
 }
 
-void streamLoop() {
+static void streamLoop() {
     while (true) {
         if (WiFi.status() != WL_CONNECTED) {
-            showStatus("WIFI", "reconnecting...", TFT_ORANGE);
+            setUiMode(UiMode::Connecting, "wifi reconnecting...");
             WiFi.reconnect();
-            delay(5000);
+            uint32_t waitUntil = millis() + 5000;
+            while ((int32_t)(millis() - waitUntil) < 0) {
+                serviceUi();
+                delay(1);
+            }
             continue;
         }
 
+        if (gChannelCount == 0 && !loadChannelList()) {
+            setFallbackChannelList();
+        }
+        (void)syncCurrentChannel();
+
         WiFiClient client;
-        showStatus("TCP", "connecting...", TFT_YELLOW);
+        setUiMode(UiMode::Connecting, "connecting...");
         Serial.printf("Connecting to %s:%d\n", SERVER_HOST, SERVER_PORT);
 
-        if (!client.connect(SERVER_HOST, SERVER_PORT)) {
-            showStatus("TCP", "connect failed", TFT_RED);
-            delay(RECONNECT_DELAY_MS);
+        uint32_t connectStartedAt = millis();
+        while (!client.connect(SERVER_HOST, SERVER_PORT)) {
+            if (WiFi.status() != WL_CONNECTED) {
+                break;
+            }
+            setUiMode(UiMode::Connecting, "connect failed");
+            uint32_t until = millis() + RECONNECT_DELAY_MS;
+            while ((int32_t)(millis() - until) < 0) {
+                serviceUi();
+                delay(1);
+            }
+            connectStartedAt = millis();
+        }
+
+        if (!client.connected()) {
             continue;
         }
 
         client.setNoDelay(true);
         initI2S();
-        showStatus("TCP", "connected", TFT_GREEN);
-        delay(250);
+        gReconnectRequested = false;
+        setUiMode(UiMode::Buffering, "buffering...");
+        beginChannelOverlay(gPendingChannelName.isEmpty() ? gChannelKeys[gCurrentChannelIndex] : gPendingChannelName);
 
         uint32_t fpsCount = 0;
         uint32_t lastStatsAt = millis();
+        bool haveFrame = false;
 
         while (client.connected()) {
             uint8_t magic[2];
@@ -233,7 +670,7 @@ void streamLoop() {
                 }
             }
 
-            if (!client.connected()) {
+            if (!client.connected() || gReconnectRequested) {
                 break;
             }
 
@@ -267,29 +704,44 @@ void streamLoop() {
             int opened = jpeg.openRAM(gRxBuf, (int)videoSize, jpegDraw);
             if (opened) {
                 jpeg.setPixelType(RGB565_BIG_ENDIAN);
-                int rc = jpeg.decode(0, 0, 0);
-                if (rc == 0) {
+                if (jpeg.decode(0, 0, 0) == 0) {
                     Serial.println("jpeg decode failed");
                 }
                 jpeg.close();
+                haveFrame = true;
+                setUiMode(UiMode::Streaming, "");
+                gLastFrameAt = millis();
+                showChannelOverlay();
             } else {
                 Serial.println("jpeg openRAM failed");
             }
 
             playPcm(gRxBuf + videoSize, audioSize);
             ++fpsCount;
+            pollTouch();
 
             uint32_t now = millis();
             if ((uint32_t)(now - lastStatsAt) >= 1000U) {
-                Serial.printf("fps=%u free_heap=%u\n", (unsigned)fpsCount, (unsigned)ESP.getFreeHeap());
+                Serial.printf(
+                    "fps=%u free_heap=%u wifi=%d frame_age=%u\n",
+                    (unsigned)fpsCount,
+                    (unsigned)ESP.getFreeHeap(),
+                    (int)WiFi.status(),
+                    (unsigned)(haveFrame ? (now - gLastFrameAt) : (now - connectStartedAt))
+                );
                 fpsCount = 0;
                 lastStatsAt = now;
             }
         }
 
         client.stop();
-        showStatus("TCP", "reconnecting...", TFT_ORANGE);
-        delay(RECONNECT_DELAY_MS);
+        gReconnectRequested = false;
+        setUiMode(UiMode::Buffering, "reconnecting...");
+        uint32_t until = millis() + RECONNECT_DELAY_MS;
+        while ((int32_t)(millis() - until) < 0) {
+            serviceUi();
+            delay(1);
+        }
     }
 }
 
@@ -322,6 +774,12 @@ void setup() {
     }
 
     connectWifi();
+    initTouch();
+    if (!loadChannelList()) {
+        setFallbackChannelList();
+    }
+    (void)syncCurrentChannel();
+    beginChannelOverlay(gPendingChannelName.isEmpty() ? gChannelKeys[gCurrentChannelIndex] : gPendingChannelName);
     streamLoop();
 }
 
