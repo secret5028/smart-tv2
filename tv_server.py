@@ -360,7 +360,13 @@ class FFmpegPipeline:
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def returncode(self) -> Optional[int]:
+        if self._proc is None:
+            return None
+        return self._proc.poll()
+
     def stop(self) -> None:
+        returncode_before_stop = self.returncode()
         for fd in (self.video_fd, self.audio_fd):
             if fd is not None:
                 try:
@@ -379,7 +385,11 @@ class FFmpegPipeline:
                 self._proc.wait(timeout=3)
 
         if self._proc is not None:
-            LOG.info("ffmpeg stopped")
+            LOG.info(
+                "ffmpeg stopped (returncode_before_stop=%s final_returncode=%s)",
+                returncode_before_stop,
+                self._proc.returncode,
+            )
         self._proc = None
 
 
@@ -452,7 +462,13 @@ def stream_loop(state: ServerState, clients: ClientManager, verbose: bool) -> No
                 fill_audio_buffer(pipeline.audio_fd, audio_buffer)
                 jpeg_bytes = video_reader.read_frame()
                 if jpeg_bytes is None:
-                    LOG.warning("video pipe ended")
+                    LOG.warning(
+                        "video pipe ended (channel=%s ffmpeg_returncode=%s buffered_audio=%d queued=%d)",
+                        channel_key,
+                        pipeline.returncode(),
+                        len(audio_buffer),
+                        len(packet_buffer),
+                    )
                     break
 
                 fill_audio_buffer(pipeline.audio_fd, audio_buffer)
@@ -503,6 +519,15 @@ def stream_loop(state: ServerState, clients: ClientManager, verbose: bool) -> No
                 if next_frame_at < now - FRAME_INTERVAL:
                     next_frame_at = now + FRAME_INTERVAL
 
+            LOG.warning(
+                "stream iteration ended (channel=%s ffmpeg_alive=%s ffmpeg_returncode=%s queued=%d clients=%d)",
+                channel_key,
+                pipeline.is_alive(),
+                pipeline.returncode(),
+                len(packet_buffer),
+                clients.count(),
+            )
+
         except KeyboardInterrupt:
             raise
         except Exception as exc:
@@ -512,7 +537,7 @@ def stream_loop(state: ServerState, clients: ClientManager, verbose: bool) -> No
 
         current_channel, current_serial = state.get()
         if current_serial == change_serial and current_channel == channel_key:
-            LOG.warning("restarting ffmpeg in 3 seconds")
+            LOG.warning("restarting ffmpeg in 3 seconds for channel=%s", channel_key)
             time.sleep(3)
 
 
