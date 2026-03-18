@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import queue
 import select
 import socket
 import struct
@@ -106,44 +107,64 @@ def resolve_stream_url(channel_key: str) -> str:
 class ClientManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._clients: list[socket.socket] = []
+        self._clients: dict[socket.socket, queue.Queue[Optional[bytes]]] = {}
 
     def add(self, conn: socket.socket) -> None:
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conn.settimeout(0.5)
+        send_queue: queue.Queue[Optional[bytes]] = queue.Queue(maxsize=3)
         with self._lock:
-            self._clients.append(conn)
+            self._clients[conn] = send_queue
             total = len(self._clients)
+        thread = threading.Thread(target=self._sender_loop, args=(conn, send_queue), daemon=True)
+        thread.start()
         try:
             peer = conn.getpeername()
         except OSError:
             peer = "<unknown>"
         LOG.info("client connected: %s (total=%d)", peer, total)
 
-    def broadcast(self, data: bytes) -> None:
-        dead: list[socket.socket] = []
-        with self._lock:
-            clients = list(self._clients)
-
-        for conn in clients:
-            try:
+    def _sender_loop(self, conn: socket.socket, send_queue: queue.Queue[Optional[bytes]]) -> None:
+        try:
+            while True:
+                data = send_queue.get()
+                if data is None:
+                    return
                 conn.sendall(data)
-            except OSError:
-                dead.append(conn)
+        except OSError:
+            pass
+        finally:
+            self._remove_client(conn)
 
-        if not dead:
-            return
-
+    def _remove_client(self, conn: socket.socket) -> None:
         with self._lock:
-            for conn in dead:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-                if conn in self._clients:
-                    self._clients.remove(conn)
+            existed = conn in self._clients
+            if existed:
+                self._clients.pop(conn, None)
             total = len(self._clients)
-        LOG.info("removed %d dead client(s) (total=%d)", len(dead), total)
+        try:
+            conn.close()
+        except OSError:
+            pass
+        if existed:
+            LOG.info("removed 1 dead client(s) (total=%d)", total)
+
+    def broadcast(self, data: bytes) -> None:
+        with self._lock:
+            clients = list(self._clients.items())
+
+        for conn, send_queue in clients:
+            try:
+                send_queue.put_nowait(data)
+            except queue.Full:
+                try:
+                    send_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    send_queue.put_nowait(data)
+                except queue.Full:
+                    LOG.debug("dropping frame for slow client")
 
     def count(self) -> int:
         with self._lock:

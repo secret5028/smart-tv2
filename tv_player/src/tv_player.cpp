@@ -150,7 +150,7 @@ void initI2S() {
     config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
     config.sample_rate = AUDIO_SAMPLE_RATE;
     config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-    config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
     config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     config.intr_alloc_flags = 0;
     config.dma_buf_count = 8;
@@ -186,7 +186,7 @@ void playPcm(const uint8_t *samples, size_t count) {
         return;
     }
 
-    static int16_t stereo[AUDIO_PLAY_CHUNK * 2];
+    static int16_t mono[AUDIO_PLAY_CHUNK];
     size_t offset = 0;
 
     while (offset < count) {
@@ -196,13 +196,11 @@ void playPcm(const uint8_t *samples, size_t count) {
         }
 
         for (size_t i = 0; i < chunkSamples; ++i) {
-            int16_t s = (int16_t)((((int)samples[offset + i]) - 128) << 8);
-            stereo[i * 2] = s;
-            stereo[i * 2 + 1] = s;
+            mono[i] = (int16_t)((((int)samples[offset + i]) - 128) << 8);
         }
 
         size_t written = 0;
-        i2s_write(I2S_NUM_1, stereo, chunkSamples * sizeof(int16_t) * 2, &written, portMAX_DELAY);
+        i2s_write(I2S_NUM_1, mono, chunkSamples * sizeof(int16_t), &written, portMAX_DELAY);
         offset += chunkSamples;
     }
 }
@@ -357,6 +355,7 @@ void streamLoop() {
             }
 
             uint8_t magic[2];
+            uint32_t recvStart = millis();
             if (!recvExact(client, magic, sizeof(magic))) {
                 break;
             }
@@ -400,7 +399,9 @@ void streamLoop() {
             if (audioSize > 0 && !recvExact(client, gRxBuf + videoSize, audioSize)) {
                 break;
             }
+            uint32_t recvEnd = millis();
 
+            uint32_t decodeStart = millis();
             int opened = jpeg.openRAM(gRxBuf, (int)videoSize, jpegDraw);
             if (opened) {
                 jpeg.setPixelType(RGB565_BIG_ENDIAN);
@@ -413,13 +414,25 @@ void streamLoop() {
             } else {
                 Serial.println("jpeg openRAM failed");
             }
+            uint32_t decodeEnd = millis();
 
+            uint32_t audioStart = millis();
             playPcm(gRxBuf + videoSize, audioSize);
+            uint32_t audioEnd = millis();
             ++fpsCount;
 
             uint32_t now = millis();
             if ((uint32_t)(now - lastStatsAt) >= 1000U) {
-                Serial.printf("fps=%u free_heap=%u\n", (unsigned)fpsCount, (unsigned)ESP.getFreeHeap());
+                Serial.printf(
+                    "fps=%u free_heap=%u recv_ms=%u decode_ms=%u audio_ms=%u v=%u a=%u\n",
+                    (unsigned)fpsCount,
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)(recvEnd - recvStart),
+                    (unsigned)(decodeEnd - decodeStart),
+                    (unsigned)(audioEnd - audioStart),
+                    (unsigned)videoSize,
+                    (unsigned)audioSize
+                );
                 fpsCount = 0;
                 lastStatsAt = now;
             }
