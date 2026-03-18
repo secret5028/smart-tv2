@@ -28,9 +28,9 @@
 
 static constexpr gpio_num_t PIN_SYS_EN = GPIO_NUM_41;
 static constexpr gpio_num_t PIN_SYS_OUT = GPIO_NUM_40;
-static constexpr gpio_num_t PIN_I2S_BCLK = GPIO_NUM_14;
-static constexpr gpio_num_t PIN_I2S_LRCK = GPIO_NUM_13;
-static constexpr gpio_num_t PIN_I2S_DOUT = GPIO_NUM_12;
+static constexpr gpio_num_t PIN_I2S_BCLK = GPIO_NUM_18;
+static constexpr gpio_num_t PIN_I2S_LRCK = GPIO_NUM_17;
+static constexpr gpio_num_t PIN_I2S_DOUT = GPIO_NUM_3;
 
 static constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;
 static constexpr size_t AUDIO_PLAY_CHUNK = 512;
@@ -41,6 +41,8 @@ static constexpr uint8_t MAGIC0 = 0xAA;
 static constexpr uint8_t MAGIC1 = 0xBB;
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 250;
 static constexpr uint32_t CHANNEL_LABEL_MS = 3000;
+static constexpr int VIDEO_X = 0;
+static constexpr int VIDEO_Y = 41;
 
 struct ChannelEntry {
     const char *key;
@@ -88,7 +90,7 @@ static uint32_t readLe32(const uint8_t *buf) {
 }
 
 int jpegDraw(JPEGDRAW *pDraw) {
-    tft.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+    tft.pushImage(VIDEO_X + pDraw->x, VIDEO_Y + pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
     return 1;
 }
 

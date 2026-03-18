@@ -14,20 +14,26 @@ import struct
 import subprocess
 import threading
 import time
+from io import BytesIO
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
 
 CHANNELS: dict[str, dict[str, str]] = {
-    "kbs": {"name": "KBS News24", "type": "direct", "url": "https://news24.gscdn.kbs.co.kr/news24-02/news24-02_hd.m3u8?Policy=eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly9uZXdzMjQuZ3NjZG4ua2JzLmNvLmtyL25ld3MyNC0wMi8qIiwiQ29uZGl0aW9uIjp7IkRhdGVMZXNzVGhhbiI6eyJBV1M6RXBvY2hUaW1lIjoxNzczOTI3NjgwfX19XX0_&Key-Pair-Id=APKAICDSGT3Y7IXGJ3TA&Signature=b3Ei6FLyKdLtLy3oM6J8y2vCbaa9zqARqFN5NVY3utG9QqwAXNqXXWwKTLSVdmG0UF7Dx-h0jpHhpuJmlvzJ81vfuPZX4Di1DnVH4u0E1ANFPs~~tHc958m8CE8-1hhw60sNV-nRL4jH9lGvT4st-2Q8~QKyqE20qGY~zrQwsmntIrPFhhQgP3gIxetmjDPlzGelMfSa9vuW~4MqtgHpGI~M-O6dz3L7bamklctKltSyaO8z~A-rZQoW5Ae9Y0GFsg01wCD5MAaABYbyvSjeo7JMh~ObQUu4gURyUT7e21SfXh5FxAJsq0wq-fX2KBA3nBqeM5NSmRDblIZOyX5a-A__"},
+    "kbs": {"name": "KBS News24", "type": "direct", "url": "https://news24.gscdn.kbs.co.kr/news24-02/news24-02_hd.m3u8?Policy=eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly9uZXdzMjQuZ3NjZG4ua2JzLmNvLmtyL25ld3MyNC0wMi8qIiwiQ29uZGl0aW9uIjp7IkRhdGVMZXNzVGhhbiI6eyJBV1M6RXBvY2hUaW1lIjoxNzczOTk5MzYwfX19XX0_&Key-Pair-Id=APKAICDSGT3Y7IXGJ3TA&Signature=BdRcWnCw-Kqs6aby5ETrskltakLtSXlMN~3I6ryM32VKbXdfnzptoOFlNA7cKRWrLE4Z-49BxyL6hnWJDCSlHlEqLk2bNx0UnOpS3OWw~T6dy9lRC58xGVv~H7QxJtRtLy0xfgHt5iNKCFLWfVzhV7xPqFcbdDX67HRi8kRhEPDApQSqs1KSVemBTA2LcJZWch2aFvPpK0qfhLO2JjxEewgpXF3E7a8FwHp49bgBqWfl3LFZeUGN4c3JkedN0Rcjy~bWgvG~FtmCmX543CZSC-1FuSDhiArP8bjFM-Js-2cOODManD0dYzMY1TxB~EZNPm9ucU9qiy7h-NGRXV-0pw__"},
     "ytn": {"name": "YTN", "type": "youtube", "url": "https://www.youtube.com/@ytnnews24/live"},
     "sbsnews": {"name": "SBS News", "type": "youtube", "url": "https://www.youtube.com/@SBSnews8/live"},
     "kbsworld": {"name": "KBS World", "type": "youtube", "url": "https://www.youtube.com/@KBSWorldTV/live"},
     "jtbc": {"name": "JTBC News", "type": "youtube", "url": "https://www.youtube.com/@jtbc_news/live"},
     "mbn": {"name": "MBN", "type": "youtube", "url": "https://www.youtube.com/@MBN/live"},
     "goodtv": {"name": "GoodTV", "type": "direct", "url": "http://mobliestream.c3tv.com:1935/live/goodtv.sdp/playlist.m3u8"},
-    "ebs1": {"name": "EBS1", "type": "direct", "url": "https://ebsonair.ebs.co.kr/ebs1familypc/familypc1m/playlist.m3u8"},
+    "ebs1": {"name": "EBS1", "type": "direct", "url": "https://ebsonair.ebs.co.kr/groundwavefamilypc/familypc1m/playlist.m3u8"},
     "ebs2": {"name": "EBS2", "type": "direct", "url": "https://ebsonair.ebs.co.kr/ebs2familypc/familypc1m/playlist.m3u8"},
     "ebskids": {"name": "EBS Kids", "type": "direct", "url": "https://ebsonair.ebs.co.kr/ebsufamilypc/familypc1m/playlist.m3u8"},
     "fgtv": {"name": "FGTV", "type": "direct", "url": "https://fgtvlive.fgtv.com/smil:fgtv.smil/playlist.m3u8"},
@@ -44,12 +50,15 @@ CHANNELS: dict[str, dict[str, str]] = {
 
 HOST = "0.0.0.0"
 WIDTH = 280
-HEIGHT = 240
+HEIGHT = 157
 FPS = 15
 FRAME_INTERVAL = 1.0 / FPS
 AUDIO_RATE = 16000
 AUDIO_CHUNK = round(AUDIO_RATE / FPS)
 JPEG_QUALITY = 12
+MAX_JPEG_BYTES = 3891
+PIL_MAX_QUALITY = 75
+PIL_MIN_QUALITY = 8
 READ_CHUNK = 4096
 PACKET_MAGIC = b"\xAA\xBB"
 BUFFER_SECONDS = 10.0
@@ -405,6 +414,50 @@ def build_packet(jpeg_bytes: bytes, audio_bytes: bytes) -> bytes:
     )
 
 
+def fit_jpeg_size(jpeg_bytes: bytes) -> bytes:
+    if len(jpeg_bytes) <= MAX_JPEG_BYTES or Image is None:
+        return jpeg_bytes
+
+    try:
+        with Image.open(BytesIO(jpeg_bytes)) as image:
+            image = image.convert("RGB")
+            best = jpeg_bytes
+            low = PIL_MIN_QUALITY
+            high = PIL_MAX_QUALITY
+
+            while low <= high:
+                quality = (low + high) // 2
+                out = BytesIO()
+                image.save(out, format="JPEG", quality=quality, optimize=True, progressive=False)
+                encoded = out.getvalue()
+
+                if len(encoded) <= MAX_JPEG_BYTES:
+                    best = encoded
+                    low = quality + 1
+                else:
+                    high = quality - 1
+
+            if len(best) > MAX_JPEG_BYTES:
+                for quality in (6, 4, 2, 1):
+                    out = BytesIO()
+                    image.save(
+                        out,
+                        format="JPEG",
+                        quality=quality,
+                        optimize=True,
+                        progressive=False,
+                    )
+                    encoded = out.getvalue()
+                    best = encoded
+                    if len(encoded) <= MAX_JPEG_BYTES:
+                        break
+
+            return best
+    except Exception:
+        LOG.exception("adaptive jpeg recompress failed")
+        return jpeg_bytes
+
+
 def fill_audio_buffer(audio_fd: int, audio_buffer: bytearray) -> None:
     while True:
         readable, _, _ = select.select([audio_fd], [], [], 0)
@@ -473,6 +526,7 @@ def stream_loop(state: ServerState, clients: ClientManager, verbose: bool) -> No
 
                 fill_audio_buffer(pipeline.audio_fd, audio_buffer)
                 audio_bytes = take_audio_chunk(audio_buffer)
+                jpeg_bytes = fit_jpeg_size(jpeg_bytes)
                 packet_buffer.append((source_time, build_packet(jpeg_bytes, audio_bytes)))
                 source_time += FRAME_INTERVAL
 
@@ -545,7 +599,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Pull a live stream with FFmpeg and push MJPEG+PCM packets to ESP32 clients."
     )
-    parser.add_argument("--channel", choices=sorted(CHANNELS), default="ytn", help="built-in channel name")
+    parser.add_argument("--channel", choices=sorted(CHANNELS), default="kbs", help="built-in channel name")
     parser.add_argument("--host", default=HOST, help="listen host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=9000, help="stream port (default: 9000)")
     parser.add_argument("--control-port", type=int, default=9001, help="control API port (default: 9001)")
@@ -562,13 +616,14 @@ def main() -> None:
     )
 
     LOG.info(
-        "video=%dx%d@%dfps audio=%dHz pcm_u8 chunk=%d q=%d",
+        "video=%dx%d@%dfps audio=%dHz pcm_u8 chunk=%d q=%d max_jpeg=%d",
         WIDTH,
         HEIGHT,
         FPS,
         AUDIO_RATE,
         AUDIO_CHUNK,
         JPEG_QUALITY,
+        MAX_JPEG_BYTES,
     )
 
     state = ServerState(args.channel)
