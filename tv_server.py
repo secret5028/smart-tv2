@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -17,6 +18,8 @@ import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+
+from PIL import Image
 
 
 CHANNELS: dict[str, dict[str, str]] = {
@@ -54,6 +57,12 @@ READ_CHUNK = 4096
 PACKET_MAGIC = b"\xAA\xBB"
 BUFFER_SECONDS = 2.0
 MAX_BUFFER_SECONDS = 4.0
+JPEG_RECOMPRESS_RULES: tuple[tuple[int, int], ...] = (
+    (4096, 12),
+    (5500, 20),
+    (7000, 22),
+    (1 << 30, 24),
+)
 
 LOG = logging.getLogger("tv_server")
 
@@ -213,6 +222,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", f"unknown channel: {channel_key}".encode("utf-8"))
             return
 
+        LOG.info("channel api request: %s from %s", channel_key, self.address_string())
         self.state.set_channel(channel_key)
         body = json.dumps(
             {"ok": True, "channel": channel_key, "name": CHANNELS[channel_key]["name"]},
@@ -427,6 +437,35 @@ def take_audio_chunk(audio_buffer: bytearray) -> bytes:
     return chunk + (b"\x80" * (AUDIO_CHUNK - len(chunk)))
 
 
+def maybe_recompress(jpeg_bytes: bytes) -> bytes:
+    target_quality: Optional[int] = None
+    for size_limit, quality in JPEG_RECOMPRESS_RULES:
+        if len(jpeg_bytes) <= size_limit:
+            if quality != JPEG_QUALITY:
+                target_quality = quality
+            break
+
+    if target_quality is None:
+        return jpeg_bytes
+
+    try:
+        img = Image.open(io.BytesIO(jpeg_bytes))
+        img = img.convert("RGB")
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=target_quality, optimize=False)
+        recompressed = out.getvalue()
+        LOG.debug(
+            "recompressed jpeg %d -> %d bytes at quality=%d",
+            len(jpeg_bytes),
+            len(recompressed),
+            target_quality,
+        )
+        return recompressed
+    except Exception:
+        LOG.exception("jpeg recompress failed, using original frame")
+        return jpeg_bytes
+
+
 def accept_loop(server: socket.socket, clients: ClientManager) -> None:
     while True:
         try:
@@ -470,6 +509,7 @@ def stream_loop(state: ServerState, clients: ClientManager, verbose: bool) -> No
                         len(packet_buffer),
                     )
                     break
+                jpeg_bytes = maybe_recompress(jpeg_bytes)
 
                 fill_audio_buffer(pipeline.audio_fd, audio_buffer)
                 audio_bytes = take_audio_chunk(audio_buffer)

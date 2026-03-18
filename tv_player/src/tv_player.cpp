@@ -5,6 +5,7 @@
 #include <JPEGDEC.h>
 #include <driver/i2s.h>
 #include <esp32-hal-psram.h>
+#include <lwip/sockets.h>
 
 #ifndef WIFI_SSID
 #define WIFI_SSID "YOUR_SSID"
@@ -35,8 +36,8 @@ static constexpr gpio_num_t PIN_I2S_DOUT = GPIO_NUM_12;
 static constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;
 static constexpr size_t AUDIO_PLAY_CHUNK = 512;
 static constexpr size_t RX_BUF_SIZE = 80 * 1024;
-static constexpr uint32_t TCP_TIMEOUT_MS = 8000;
-static constexpr uint32_t RECONNECT_DELAY_MS = 3000;
+static constexpr uint32_t TCP_TIMEOUT_MS = 15000;
+static constexpr uint32_t RECONNECT_DELAY_MS = 4000;
 static constexpr uint8_t MAGIC0 = 0xAA;
 static constexpr uint8_t MAGIC1 = 0xBB;
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 250;
@@ -75,6 +76,8 @@ static JPEGDEC jpeg;
 static uint8_t *gRxBuf = nullptr;
 static bool gI2sReady = false;
 static size_t gChannelIndex = 0;
+static bool gPendingChannelChange = false;
+static size_t gPendingChannelIndex = 0;
 static uint32_t gChannelOverlayUntil = 0;
 static uint32_t gLastButtonAt = 0;
 static bool gLastButtonPressed = false;
@@ -90,6 +93,15 @@ static uint32_t readLe32(const uint8_t *buf) {
 int jpegDraw(JPEGDRAW *pDraw) {
     tft.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
     return 1;
+}
+
+static size_t findChannelIndex(const char *key) {
+    for (size_t i = 0; i < (sizeof(CHANNELS) / sizeof(CHANNELS[0])); ++i) {
+        if (strcmp(CHANNELS[i].key, key) == 0) {
+            return i;
+        }
+    }
+    return gChannelIndex;
 }
 
 static void drawChannelOverlay() {
@@ -206,16 +218,73 @@ void playPcm(const uint8_t *samples, size_t count) {
 }
 
 bool postChannel(const char *key) {
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        WiFiClient api;
+        api.setTimeout(3000);
+        Serial.printf("channel api -> %s:%d / %s (try %d)\n", SERVER_HOST, API_PORT, key, attempt);
+        if (!api.connect(SERVER_HOST, API_PORT)) {
+            Serial.println("channel api connect failed");
+            delay(100);
+            continue;
+        }
+
+        api.printf(
+            "POST /channel/%s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            key,
+            SERVER_HOST,
+            API_PORT
+        );
+
+        uint32_t deadline = millis() + 3000;
+        while (api.connected() && !api.available()) {
+            if ((int32_t)(millis() - deadline) > 0) {
+                api.stop();
+                Serial.println("channel api timeout");
+                break;
+            }
+            yield();
+        }
+
+        bool ok = false;
+        while (api.connected() || api.available()) {
+            String line = api.readStringUntil('\n');
+            line.trim();
+            if (line.length() > 0) {
+                Serial.printf("channel api resp: %s\n", line.c_str());
+            }
+            if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200")) {
+                ok = true;
+            }
+            if (line.length() == 0) {
+                break;
+            }
+        }
+        api.stop();
+
+        if (ok) {
+            gChannelOverlayUntil = millis() + CHANNEL_LABEL_MS;
+            gChannelIndex = findChannelIndex(key);
+            Serial.printf("channel -> %s\n", key);
+            return true;
+        }
+
+        delay(100);
+    }
+
+    return false;
+}
+
+void syncChannelFromServer() {
     WiFiClient api;
-    Serial.printf("channel api -> %s:%d / %s\n", SERVER_HOST, API_PORT, key);
+    api.setTimeout(3000);
+    Serial.printf("channel status -> %s:%d\n", SERVER_HOST, API_PORT);
     if (!api.connect(SERVER_HOST, API_PORT)) {
-        Serial.println("channel api connect failed");
-        return false;
+        Serial.println("channel status connect failed");
+        return;
     }
 
     api.printf(
-        "POST /channel/%s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        key,
+        "GET /status HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
         SERVER_HOST,
         API_PORT
     );
@@ -224,32 +293,43 @@ bool postChannel(const char *key) {
     while (api.connected() && !api.available()) {
         if ((int32_t)(millis() - deadline) > 0) {
             api.stop();
-            return false;
+            Serial.println("channel status timeout");
+            return;
         }
-        delay(1);
+        yield();
     }
 
-    bool ok = false;
+    bool bodyStarted = false;
+    String body;
     while (api.connected() || api.available()) {
         String line = api.readStringUntil('\n');
+        if (bodyStarted) {
+            body += line;
+            continue;
+        }
         line.trim();
-        if (line.length() > 0) {
-            Serial.printf("channel api resp: %s\n", line.c_str());
-        }
-        if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200")) {
-            ok = true;
-        }
         if (line.length() == 0) {
-            break;
+            bodyStarted = true;
         }
     }
     api.stop();
 
-    if (ok) {
-        gChannelOverlayUntil = millis() + CHANNEL_LABEL_MS;
-        Serial.printf("channel -> %s\n", key);
+    int keyPos = body.indexOf("\"channel\"");
+    if (keyPos < 0) {
+        Serial.printf("channel status body: %s\n", body.c_str());
+        return;
     }
-    return ok;
+    int colon = body.indexOf(':', keyPos);
+    int q1 = body.indexOf('"', colon + 1);
+    int q2 = body.indexOf('"', q1 + 1);
+    if (q1 < 0 || q2 < 0) {
+        Serial.printf("channel status parse failed: %s\n", body.c_str());
+        return;
+    }
+
+    String channelKey = body.substring(q1 + 1, q2);
+    gChannelIndex = findChannelIndex(channelKey.c_str());
+    Serial.printf("channel sync -> %s\n", CHANNELS[gChannelIndex].key);
 }
 
 bool handleChannelButton(WiFiClient *streamClient) {
@@ -264,17 +344,16 @@ bool handleChannelButton(WiFiClient *streamClient) {
 
     if (pressed && !gLastButtonPressed && (uint32_t)(now - gLastButtonAt) >= BUTTON_DEBOUNCE_MS) {
         gLastButtonAt = now;
-        gChannelIndex = (gChannelIndex + 1) % (sizeof(CHANNELS) / sizeof(CHANNELS[0]));
-        Serial.printf("button accepted -> next channel %s\n", CHANNELS[gChannelIndex].key);
-        if (postChannel(CHANNELS[gChannelIndex].key)) {
-            showStatus("CHANNEL", CHANNELS[gChannelIndex].label, TFT_GREEN);
-            delay(250);
-            if (streamClient != nullptr) {
-                streamClient->stop();
-            }
-            gLastButtonPressed = pressed;
-            return true;
+        size_t nextIndex = (gChannelIndex + 1) % (sizeof(CHANNELS) / sizeof(CHANNELS[0]));
+        const char *nextKey = CHANNELS[nextIndex].key;
+        Serial.printf("button accepted -> next channel %s\n", nextKey);
+        gPendingChannelIndex = nextIndex;
+        gPendingChannelChange = true;
+        if (streamClient != nullptr) {
+            streamClient->stop();
         }
+        gLastButtonPressed = pressed;
+        return true;
     }
 
     gLastButtonPressed = pressed;
@@ -300,18 +379,22 @@ bool recvExact(WiFiClient &client, uint8_t *dst, size_t n) {
 
         int available = client.available();
         if (available <= 0) {
-            delay(1);
+            yield();
             continue;
         }
 
         size_t want = n - received;
-        if (want > (size_t)available) {
-            want = (size_t)available;
+        size_t canRead = (size_t)available;
+        if (canRead > 4096) {
+            canRead = 4096;
+        }
+        if (want < canRead) {
+            canRead = want;
         }
 
-        int got = client.read(dst + received, want);
+        int got = client.read(dst + received, canRead);
         if (got <= 0) {
-            delay(1);
+            yield();
             continue;
         }
 
@@ -324,6 +407,20 @@ bool recvExact(WiFiClient &client, uint8_t *dst, size_t n) {
 
 void streamLoop() {
     while (true) {
+        if (gPendingChannelChange) {
+            const char *nextKey = CHANNELS[gPendingChannelIndex].key;
+            showStatus("CHANNEL", CHANNELS[gPendingChannelIndex].label, TFT_YELLOW);
+            Serial.printf("apply pending channel -> %s\n", nextKey);
+            if (postChannel(nextKey)) {
+                showStatus("CHANNEL", CHANNELS[gChannelIndex].label, TFT_GREEN);
+                delay(250);
+            } else {
+                showStatus("CHANNEL", "api failed", TFT_RED);
+                delay(500);
+            }
+            gPendingChannelChange = false;
+        }
+
         if (WiFi.status() != WL_CONNECTED) {
             showStatus("WIFI", "reconnecting...", TFT_ORANGE);
             WiFi.reconnect();
@@ -342,6 +439,12 @@ void streamLoop() {
         }
 
         client.setNoDelay(true);
+        int fd = client.fd();
+        int rcvbuf = 16384;
+        if (fd >= 0) {
+            int rc = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+            Serial.printf("SO_RCVBUF fd=%d rc=%d size=%d\n", fd, rc, rcvbuf);
+        }
         initI2S();
         showStatus("TCP", "connected", TFT_GREEN);
         delay(250);
@@ -474,6 +577,7 @@ void setup() {
     }
 
     connectWifi();
+    syncChannelFromServer();
     streamLoop();
 }
 
