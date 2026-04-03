@@ -3,5 +3,8 @@ __pycache__/
 *.pyc
 *.log
 *.zip
+eim_config.toml
+s3watch/
+waveshare_official/**/build/
 
 tv_player/.pio/
